@@ -11,22 +11,54 @@
 
 const FPL_BASE = "https://fantasy.premierleague.com/api";
 
+/* Each entry: build(url) -> fetch URL, and parse(rawText) -> JSON.
+   Several independent free relays, tried in order, with a per-try
+   timeout so one dead relay doesn't stall the whole load. The index
+   of whichever one works first is remembered so later calls go
+   straight to it instead of re-testing dead ones every time. */
 const PROXIES = [
-  (u) => u, // try direct first (works if you later add your own backend/proxy)
-  (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-  (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
-  (u) => `https://thingproxy.freeboard.io/fetch/${u}`,
+  { build: (u) => u, parse: (t) => JSON.parse(t) }, // direct — works once you add your own tiny proxy/backend
+  { build: (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`, parse: (t) => JSON.parse(t) },
+  { build: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`, parse: (t) => JSON.parse(t) },
+  { build: (u) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, parse: (t) => JSON.parse(JSON.parse(t).contents) },
+  { build: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`, parse: (t) => JSON.parse(t) },
+  { build: (u) => `https://thingproxy.freeboard.io/fetch/${u}`, parse: (t) => JSON.parse(t) },
 ];
 
-async function fetchJSON(path) {
+let workingProxyIndex = null;
+
+async function tryFetch(proxy, url, timeoutMs = 9000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(proxy.build(url), { headers: { Accept: "application/json" }, signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    return proxy.parse(text);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchJSON(path, onProgress) {
   const url = `${FPL_BASE}${path}`;
-  let lastErr;
-  for (const wrap of PROXIES) {
+
+  // A relay that already worked this session — use it first.
+  if (workingProxyIndex !== null) {
     try {
-      const res = await fetch(wrap(url), { headers: { Accept: "application/json" } });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const text = await res.text();
-      return JSON.parse(text);
+      return await tryFetch(PROXIES[workingProxyIndex], url);
+    } catch (e) {
+      workingProxyIndex = null; // it died mid-session, fall through and re-test
+    }
+  }
+
+  let lastErr;
+  for (let i = 0; i < PROXIES.length; i++) {
+    onProgress?.(i + 1, PROXIES.length);
+    try {
+      const data = await tryFetch(PROXIES[i], url);
+      workingProxyIndex = i;
+      return data;
     } catch (e) {
       lastErr = e;
       continue;
@@ -77,7 +109,7 @@ function hideStatus() {
 async function boot() {
   try {
     setStatus("Loading players, teams and gameweeks…");
-    S.bootstrap = await fetchJSON("/bootstrap-static/");
+    S.bootstrap = await fetchJSON("/bootstrap-static/", (i, n) => setStatus(`Loading players, teams and gameweeks… (trying data route ${i}/${n})`));
     S.bootstrap.elements.forEach((e) => S.elementsById.set(e.id, e));
     S.bootstrap.teams.forEach((t) => S.teamsById.set(t.id, t));
     S.bootstrap.element_types.forEach((t) => S.typesById.set(t.id, t));
@@ -85,7 +117,7 @@ async function boot() {
     S.nextEvent = S.bootstrap.events.find((e) => e.is_next) || S.bootstrap.events.find((e) => !e.finished);
 
     setStatus("Loading fixtures…");
-    S.fixtures = await fetchJSON("/fixtures/");
+    S.fixtures = await fetchJSON("/fixtures/", (i, n) => setStatus(`Loading fixtures… (trying data route ${i}/${n})`));
 
     hideStatus();
     renderGwPill();
@@ -101,12 +133,18 @@ async function boot() {
     renderCompare();
   } catch (e) {
     console.error(e);
-    setStatus(
-      "Couldn't reach the FPL API through any available route right now. The public proxies used for CORS sometimes rate-limit — wait a minute and refresh, or run this from a browser extension/backend that removes the CORS restriction. (Technical detail: " +
-        esc(e.message) +
-        ")",
-      true
-    );
+    workingProxyIndex = null;
+    const el = document.getElementById("statusline");
+    el.classList.add("err");
+    el.innerHTML =
+      `<span>Couldn't reach the FPL API through any of the ${PROXIES.length} available routes right now. Free public relays get overloaded sometimes — this isn't tied to any account limit. Technical detail: ${esc(e.message)}</span>` +
+      `<button class="btn-more" id="retryBtn" style="margin-left:auto;flex-shrink:0;">Retry</button>`;
+    document.getElementById("retryBtn").addEventListener("click", () => {
+      el.classList.remove("err");
+      el.style.display = "";
+      el.innerHTML = `<span class="spinner"></span><span id="statusText">Retrying…</span>`;
+      boot();
+    });
   }
 }
 
