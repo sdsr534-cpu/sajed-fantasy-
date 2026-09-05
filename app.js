@@ -130,6 +130,7 @@ async function boot() {
     setupFixturePicker();
     setupLivePicker();
     setupDreamPicker();
+    setupMyTeam();
     renderCompare();
   } catch (e) {
     console.error(e);
@@ -587,6 +588,141 @@ function renderCompare() {
   wrap.querySelectorAll(".compare-remove").forEach((btn) =>
     btn.addEventListener("click", () => toggleCompare(parseInt(btn.dataset.id, 10)))
   );
+}
+
+/* ---------------- MY TEAM ----------------
+   FPL has no public "Sign in with Google" and no public OAuth for
+   third-party sites — the only real login lives on the official FPL
+   site itself. What IS public, with no password at all, is a
+   manager's numeric Team ID (visible in their own browser address
+   bar). Anyone's squad/history is viewable with just that number, so
+   it's the actual simplest safe option here — not a workaround. */
+const TEAM_ID_KEY = "sajedFantasyTeamId";
+const CHIP_LABELS = { wildcard: "Wildcard", "3xc": "Triple Captain", bboost: "Bench Boost", freehit: "Free Hit" };
+
+function setupMyTeam() {
+  const input = document.getElementById("teamIdInput");
+  const loadBtn = document.getElementById("loadTeamBtn");
+  const forgetBtn = document.getElementById("forgetTeamBtn");
+
+  loadBtn.addEventListener("click", () => {
+    const id = input.value.trim();
+    if (!/^\d{1,9}$/.test(id)) {
+      document.getElementById("myTeamContent").innerHTML = `<div class="statusline err">That doesn't look like a Team ID — it's just digits, e.g. 1234567.</div>`;
+      return;
+    }
+    localStorage.setItem(TEAM_ID_KEY, id);
+    forgetBtn.style.display = "";
+    loadMyTeam(id);
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") loadBtn.click();
+  });
+  forgetBtn.addEventListener("click", () => {
+    localStorage.removeItem(TEAM_ID_KEY);
+    input.value = "";
+    forgetBtn.style.display = "none";
+    document.getElementById("myTeamContent").innerHTML = "";
+  });
+
+  const saved = localStorage.getItem(TEAM_ID_KEY);
+  if (saved) {
+    input.value = saved;
+    forgetBtn.style.display = "";
+    loadMyTeam(saved);
+  }
+}
+
+async function loadMyTeam(id) {
+  const wrap = document.getElementById("myTeamContent");
+  wrap.innerHTML = `<div class="statusline"><span class="spinner"></span><span>Loading team ${esc(id)}…</span></div>`;
+  try {
+    const [entry, history] = await Promise.all([fetchJSON(`/entry/${id}/`), fetchJSON(`/entry/${id}/history/`)]);
+    S.myTeam = { id, entry, history };
+    renderMyTeam();
+  } catch (e) {
+    wrap.innerHTML = `<div class="statusline err">Couldn't find a team with that ID, or every data route is busy right now. Double-check the number (it's the digits after /entry/ in your FPL URL) and try again. (${esc(e.message)})</div>`;
+  }
+}
+
+function renderMyTeam() {
+  const { id, entry, history } = S.myTeam;
+  const wrap = document.getElementById("myTeamContent");
+
+  const chipsHtml = (history.chips || [])
+    .map((c) => `<span class="chip-used">${CHIP_LABELS[c.name] || c.name} · GW${c.event}</span>`)
+    .join("") || `<span style="color:var(--ink-faint);font-size:12.5px;">No chips played yet</span>`;
+
+  const gws = history.current || [];
+  const maxPts = Math.max(1, ...gws.map((g) => g.points));
+  const barsHtml = gws
+    .map((g) => `<div class="history-bar" title="GW${g.event}: ${g.points} pts"><i style="height:${(g.points / maxPts) * 100}%"></i></div>`)
+    .join("");
+
+  wrap.innerHTML = `
+    <div class="card manager-card" style="margin-bottom:18px;">
+      <div>
+        <div class="manager-id">${esc(entry.player_first_name)} ${esc(entry.player_last_name)}</div>
+        <div class="manager-team">${esc(entry.name)} · Team ID ${id}</div>
+        <div class="chips-row">${chipsHtml}</div>
+      </div>
+      <div class="stat-row" style="margin-top:0;">
+        <div class="stat-box"><div class="v">${entry.summary_overall_points ?? "—"}</div><div class="k">Overall points</div></div>
+        <div class="stat-box"><div class="v">${entry.summary_overall_rank?.toLocaleString?.() ?? "—"}</div><div class="k">Overall rank</div></div>
+        <div class="stat-box"><div class="v">${entry.summary_event_points ?? "—"}</div><div class="k">Last GW points</div></div>
+        <div class="stat-box"><div class="v">${money(entry.last_deadline_value)}</div><div class="k">Team value</div></div>
+        <div class="stat-box"><div class="v">${money(entry.last_deadline_bank)}</div><div class="k">In the bank</div></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:18px;">
+      <h3>Points by gameweek</h3>
+      <div class="history-chart">${barsHtml || `<span style="color:var(--ink-faint);font-size:13px;">No finished gameweeks yet</span>`}</div>
+    </div>
+
+    <div class="section-head" style="margin-top:0;"><h2 style="font-size:18px;">Squad picks</h2>
+      <select id="myTeamGwPicker"></select>
+    </div>
+    <div class="pitch" id="myTeamPitch"><div style="color:var(--ink-faint);padding:20px;text-align:center;">Pick a gameweek above</div></div>
+  `;
+
+  const sel = document.getElementById("myTeamGwPicker");
+  const options = gws.length ? gws.map((g) => g.event) : [S.currentEvent?.id].filter(Boolean);
+  sel.innerHTML = options.map((ev) => `<option value="${ev}">Gameweek ${ev}</option>`).join("");
+  sel.value = options[options.length - 1] || "";
+  sel.addEventListener("change", () => loadMyTeamPicks(id, parseInt(sel.value, 10)));
+  if (sel.value) loadMyTeamPicks(id, parseInt(sel.value, 10));
+}
+
+async function loadMyTeamPicks(id, gw) {
+  const pitch = document.getElementById("myTeamPitch");
+  pitch.innerHTML = `<div style="color:var(--ink-faint);padding:20px;text-align:center;">Loading gameweek ${gw}…</div>`;
+  try {
+    const [picksData, liveData] = await Promise.all([
+      fetchJSON(`/entry/${id}/event/${gw}/picks/`),
+      S.liveCache.get(gw) ? Promise.resolve(S.liveCache.get(gw)) : fetchJSON(`/event/${gw}/live/`).then((d) => (S.liveCache.set(gw, d), d)),
+    ]);
+    const liveById = new Map(liveData.elements.map((e) => [e.id, e.stats]));
+    const starters = picksData.picks.filter((p) => p.position <= 11);
+    const bench = picksData.picks.filter((p) => p.position > 11);
+
+    const cardFor = (pick) => {
+      const p = S.elementsById.get(pick.element);
+      if (!p) return "";
+      const stats = liveById.get(pick.element);
+      const pts = (stats?.total_points ?? 0) * pick.multiplier;
+      const badge = pick.is_captain ? `<div class="badge-c">${pick.multiplier >= 3 ? "TC" : "C"}</div>` : pick.is_vice_captain ? `<div class="badge-v">V</div>` : "";
+      return `<div class="pitch-card">${badge}<div class="n">${esc(p.web_name)}</div><div class="p">${pts} pts</div></div>`;
+    };
+
+    pitch.innerHTML = `
+      <div class="gw-squad-row">${starters.map(cardFor).join("")}</div>
+      <div class="bench-label">Bench</div>
+      <div class="gw-squad-row">${bench.map(cardFor).join("")}</div>
+    `;
+  } catch (e) {
+    pitch.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center;">No public picks for this gameweek yet (it may be before the deadline), or the data route is busy.</div>`;
+  }
 }
 
 /* ---------------- TAB NAVIGATION ---------------- */
